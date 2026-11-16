@@ -1,5 +1,9 @@
 # Forge — a GitHub-compatible git forge in one Node process
 
+[![make.fun bounty](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Shiizuku/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Shiizuku/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 An entry for the make.fun bounty **Build a GitHub-compatible git forge**
 (github-core-clone-01), submitted by @qyxra.
 
