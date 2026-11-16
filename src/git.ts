@@ -413,6 +413,21 @@ export function ingestPack(store: Store, pack: Buffer): number {
 // -------------------------------------------------------------------------------------------
 // Ref advertisement
 
+/** Follow an annotated tag chain to the commit it ultimately names, or null. */
+function peelTag(store: Store, sha: string): string | null {
+  let current = sha;
+  for (let depth = 0; depth < 10; depth++) {
+    const obj = store.readObject(current);
+    if (!obj || obj.type !== 'tag') return depth === 0 ? null : current;
+    const match = /^object ([0-9a-f]{40})$/m.exec(obj.data.toString('utf8'));
+    if (!match) return null;
+    current = match[1] as string;
+    const target = store.readObject(current);
+    if (target && target.type === 'commit') return current;
+  }
+  return null;
+}
+
 function repoOr404(store: Store, owner: string, name: string): Repo | null {
   if (owner !== 'adaiversen') return null;
   return store.getRepo(owner, name) ?? null;
@@ -441,18 +456,18 @@ export function handleGitInfoRefs(store: Store, owner: string, name: string, ser
       return { status: 200, rawBody: Buffer.concat(lines), contentType: 'application/x-git-upload-pack-advertisement' };
     }
     const caps = 'multi_ack_detailed no-done side-band-64k thin-pack ofs-delta deepen-since deepen-not agent=forge/1.0';
-    return { status: 200, rawBody: v0Advertisement(repo, 'git-upload-pack', caps), contentType: 'application/x-git-upload-pack-advertisement' };
+    return { status: 200, rawBody: v0Advertisement(store, repo, 'git-upload-pack', caps), contentType: 'application/x-git-upload-pack-advertisement' };
   }
 
   if (service === 'git-receive-pack') {
     const caps = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=forge/1.0';
-    return { status: 200, rawBody: v0Advertisement(repo, 'git-receive-pack', caps), contentType: 'application/x-git-receive-pack-advertisement' };
+    return { status: 200, rawBody: v0Advertisement(store, repo, 'git-receive-pack', caps), contentType: 'application/x-git-receive-pack-advertisement' };
   }
 
   return { status: 403, body: { message: 'Forbidden' } };
 }
 
-function v0Advertisement(repo: Repo, service: string, caps: string): Buffer {
+function v0Advertisement(store: Store, repo: Repo, service: string, caps: string): Buffer {
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const headSha = store.branchTip(repo, repo.defaultBranch);
   const headTarget = `refs/heads/${repo.defaultBranch}`;
@@ -463,11 +478,9 @@ function v0Advertisement(repo: Repo, service: string, caps: string): Buffer {
     parts.push(pktLine(`${ZERO} capabilities^{}\0${firstCaps}\n`));
   }
   for (const [ref, sha] of sortedRefs(repo)) {
-    if (ref === `refs/heads/${repo.defaultBranch}` && sha === headSha) {
-      parts.push(pktLine(`${sha} ${ref}\n`));
-    } else {
-      parts.push(pktLine(`${sha} ${ref}\n`));
-    }
+    parts.push(pktLine(`${sha} ${ref}\n`));
+    const peeled = peelTag(store, sha);
+    if (peeled) parts.push(pktLine(`${peeled} ${ref}^{}\n`));
   }
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
@@ -527,10 +540,24 @@ function shallowClosure(store: Store, tips: string[], depth: number): { objects:
   const includedCommits = [...levels.entries()].filter(([, level]) => level < depth).map(([sha]) => sha);
   // Boundary = included commits whose parents fall outside the depth.
   const boundary: string[] = [];
-  const objects = store.closureFromCommits(includedCommits, new Set());
+  // The pack holds exactly the included commits plus their trees and blobs — parents are
+  // NOT followed (that is what makes the clone shallow).
+  const objects = new Map<string, GitObject>();
+  const addTreeClosure = (treeSha: string): void => {
+    const obj = store.readObject(treeSha);
+    if (!obj || objects.has(treeSha)) return;
+    objects.set(treeSha, obj);
+    if (obj.type === 'tree') {
+      for (const entry of parseTree(obj.data)) addTreeClosure(entry.sha);
+    }
+  };
   for (const sha of includedCommits) {
     const commit = store.readCommit(sha);
-    if (commit && commit.parents.some((p) => !levels.has(p) || (levels.get(p) as number) >= depth)) boundary.push(sha);
+    if (!commit) continue;
+    const obj = store.readObject(sha);
+    if (obj) objects.set(sha, obj);
+    addTreeClosure(commit.tree);
+    if (commit.parents.some((p) => !levels.has(p) || (levels.get(p) as number) >= depth)) boundary.push(sha);
   }
   return { objects, shallow: boundary };
 }
@@ -547,11 +574,20 @@ function fetchResponse(store: Store, repo: Repo, wants: string[], haves: string[
   } else {
     const exclude = haves.length > 0 ? store.reachableSet(haves.filter((sha) => store.readCommit(sha))) : new Set<string>();
     objects = store.closureFromCommits(wantCommits, exclude);
-    // Also include any wanted non-commit objects directly.
+    // Also include any wanted non-commit objects directly (tags and their targets), unless
+    // the client already has them.
     for (const want of wants) {
-      if (!objects.has(want)) {
+      if (!objects.has(want) && !exclude.has(want)) {
         const obj = store.readObject(want);
-        if (obj) objects.set(want, obj);
+        if (obj) {
+          objects.set(want, obj);
+          if (obj.type === 'tag') {
+            const peeled = peelTag(store, want);
+            if (peeled && !objects.has(peeled)) {
+              for (const [sha, target] of store.closureFromCommits([peeled], exclude)) objects.set(sha, target);
+            }
+          }
+        }
       }
     }
   }
@@ -589,8 +625,11 @@ function uploadPackV2(store: Store, repo: Repo, body: Buffer): RestResult {
   const command = commandLine.startsWith('command=') ? commandLine.slice('command='.length) : '';
 
   if (command === 'ls-refs') {
-    const args = first.slice(1).map((b) => b.toString('utf8').replace(/\n$/, ''));
+    // v2 request shape: command + capabilities, a delim, then the argument lines.
+    const argSection = sections[1] ?? first.slice(1);
+    const args = argSection.map((b) => b.toString('utf8').replace(/\n$/, ''));
     const symrefs = args.includes('symrefs');
+    const peel = args.includes('peel');
     const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice('ref-prefix '.length));
     const parts: Buffer[] = [];
     const headSha = store.branchTip(repo, repo.defaultBranch);
@@ -605,7 +644,12 @@ function uploadPackV2(store: Store, repo: Repo, body: Buffer): RestResult {
     }
     for (const [ref, sha] of sortedRefs(repo)) {
       if (!matches(ref)) continue;
-      parts.push(pktLine(`${sha} ${ref}\n`));
+      let line = `${sha} ${ref}`;
+      if (peel) {
+        const peeled = peelTag(store, sha);
+        if (peeled) line += ` peeled:${peeled}`;
+      }
+      parts.push(pktLine(`${line}\n`));
     }
     parts.push(PKT_FLUSH);
     return { status: 200, rawBody: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };
@@ -690,7 +734,15 @@ function applyUpdate(store: Store, repo: Repo, update: RefUpdate, unpackOk: bool
     return `ok ${ref}`;
   }
   const commit = store.readCommit(newSha);
-  if (!commit) return `ng ${ref} unknown object`;
+  if (!commit) {
+    // Refs may also point at tag objects (annotated tags); those need no ancestry check.
+    const obj = store.readObject(newSha);
+    if (obj && obj.type === 'tag') {
+      repo.refs.set(ref, newSha);
+      return `ok ${ref}`;
+    }
+    return `ng ${ref} unknown object`;
+  }
   if (oldSha !== ZERO) {
     if (!store.isAncestor(oldSha, newSha)) return `ng ${ref} non-fast-forward`;
   }
