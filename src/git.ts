@@ -89,7 +89,7 @@ export function buildPack(objects: Map<string, GitObject>, store: Store): Buffer
   header.writeUInt32BE(objects.size, 8);
   parts.push(header);
   for (const [, obj] of objects) {
-    const compressed = deflateSync(obj.data);
+    const compressed = deflateSync(obj.data, { level: 1 });
     let size = obj.data.length;
     const first = (typeId(obj.type) << 4) | (size & 0x0f);
     size >>= 4;
@@ -138,28 +138,42 @@ function readPackObjectHeader(pack: Buffer, offset: number): PackObjectHeader {
 // Inflate (RFC 1951/1950) — a small exact decoder, so pack parsing knows each stream's length.
 
 class BitReader {
-  bitPos = 0;
+  private bitBuf = 0;
+  private bitCnt = 0;
   private buf: Buffer;
-  private start: number;
+  private pos: number;
   constructor(buf: Buffer, start: number) {
     this.buf = buf;
-    this.start = start;
+    this.pos = start;
+  }
+  private fill(n: number): void {
+    while (this.bitCnt < n) {
+      this.bitBuf |= (this.buf[this.pos++] ?? 0) << this.bitCnt;
+      this.bitCnt += 8;
+    }
   }
   read(bits: number): number {
-    let value = 0;
-    for (let i = 0; i < bits; i++) {
-      const byteIndex = this.start + (this.bitPos >> 3);
-      const bit = ((this.buf[byteIndex] as number) >> (this.bitPos & 7)) & 1;
-      value |= bit << i;
-      this.bitPos += 1;
-    }
+    if (bits === 0) return 0;
+    this.fill(bits);
+    const value = this.bitBuf & ((1 << bits) - 1);
+    this.bitBuf >>>= bits;
+    this.bitCnt -= bits;
     return value;
   }
   alignByte(): void {
-    this.bitPos = (this.bitPos + 7) & ~7;
+    const drop = this.bitCnt & 7;
+    this.bitBuf >>>= drop;
+    this.bitCnt -= drop;
   }
+  /** Absolute byte index of the next unread bit; exact right after alignByte(). */
   get bytePos(): number {
-    return this.start + (this.bitPos >> 3);
+    return this.pos - (this.bitCnt >> 3);
+  }
+  /** Discard the buffered bits and continue reading at an absolute byte index. */
+  jumpTo(byteIndex: number): void {
+    this.pos = byteIndex;
+    this.bitBuf = 0;
+    this.bitCnt = 0;
   }
 }
 
@@ -204,11 +218,19 @@ const LENGTH_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3
 const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 
-function inflateBlock(reader: BitReader, out: number[], lit: Huffman, dist: Huffman): boolean {
+/** A growable byte buffer inflate writes into; preallocated to the expected size when known. */
+interface ByteSink {
+  buf: Buffer;
+  len: number;
+  ensure(extra: number): void;
+}
+
+function inflateBlock(reader: BitReader, sink: ByteSink, lit: Huffman, dist: Huffman): boolean {
   for (;;) {
     const symbol = decodeSymbol(reader, lit);
     if (symbol < 256) {
-      out.push(symbol);
+      sink.ensure(1);
+      sink.buf[sink.len++] = symbol;
     } else if (symbol === 256) {
       return true;
     } else {
@@ -218,33 +240,64 @@ function inflateBlock(reader: BitReader, out: number[], lit: Huffman, dist: Huff
       const distSymbol = decodeSymbol(reader, dist);
       if (distSymbol >= 30) throw new Error('bad distance symbol');
       const distance = (DIST_BASE[distSymbol] as number) + reader.read(DIST_EXTRA[distSymbol] as number);
-      if (distance > out.length) throw new Error('distance too far');
-      const start = out.length - distance;
-      for (let i = 0; i < length; i++) out.push(out[start + i] as number);
+      if (distance > sink.len) throw new Error('distance too far');
+      sink.ensure(length);
+      const src = sink.len - distance;
+      if (distance === 1) {
+        sink.buf.fill(sink.buf[src] as number, sink.len, sink.len + length);
+      } else if (distance >= length) {
+        sink.buf.copyWithin(sink.len, src, src + length);
+      } else {
+        for (let i = 0; i < length; i++) sink.buf[sink.len + i] = sink.buf[src + i] as number;
+      }
+      sink.len += length;
     }
   }
 }
 
+let FIXED_LIT: Huffman | null = null;
+let FIXED_DIST: Huffman | null = null;
+
+/** The fixed Huffman tables, built once (they are the same for every fixed block). */
+function fixedTables(): { lit: Huffman; dist: Huffman } {
+  if (FIXED_LIT === null || FIXED_DIST === null) {
+    const litLengths = [...new Array(144).fill(8), ...new Array(112).fill(9), ...new Array(24).fill(7), ...new Array(8).fill(8)];
+    FIXED_LIT = buildHuffman(litLengths);
+    FIXED_DIST = buildHuffman(new Array(32).fill(5));
+  }
+  return { lit: FIXED_LIT, dist: FIXED_DIST };
+}
+
 /** Inflate one zlib stream starting at `start`; returns the data and the offset just past it. */
-export function inflateExact(buf: Buffer, start: number): { data: Buffer; next: number } {
+export function inflateExact(buf: Buffer, start: number, expectedSize = 0): { data: Buffer; next: number } {
   // zlib header: 2 bytes; verify the checksum bits loosely.
   const reader = new BitReader(buf, start + 2);
-  const out: number[] = [];
+  const sink: ByteSink = {
+    buf: Buffer.allocUnsafe(Math.max(expectedSize, 1024)),
+    len: 0,
+    ensure(extra: number): void {
+      if (sink.len + extra <= sink.buf.length) return;
+      const grown = Buffer.allocUnsafe(Math.max(sink.buf.length * 2, sink.len + extra));
+      sink.buf.copy(grown, 0, 0, sink.len);
+      sink.buf = grown;
+    },
+  };
   for (;;) {
     const final = reader.read(1);
     const type = reader.read(2);
     if (type === 0) {
       reader.alignByte();
-      const len = (buf[reader.bytePos] as number) | ((buf[reader.bytePos + 1] as number) << 8);
-      for (let i = 0; i < len; i++) out.push(buf[reader.bytePos + 4 + i] as number);
-      reader.bitPos += (4 + len) * 8;
+      const at = reader.bytePos;
+      const len = (buf[at] as number) | ((buf[at + 1] as number) << 8);
+      sink.ensure(len);
+      sink.buf.set(buf.subarray(at + 4, at + 4 + len), sink.len);
+      sink.len += len;
+      reader.jumpTo(at + 4 + len);
     } else {
       let lit: Huffman;
       let dist: Huffman;
       if (type === 1) {
-        const litLengths = [...new Array(144).fill(8), ...new Array(112).fill(9), ...new Array(24).fill(7), ...new Array(8).fill(8)];
-        lit = buildHuffman(litLengths);
-        dist = buildHuffman(new Array(32).fill(5));
+        ({ lit, dist } = fixedTables());
       } else if (type === 2) {
         const hlit = reader.read(5) + 257;
         const hdist = reader.read(5) + 1;
@@ -275,13 +328,14 @@ export function inflateExact(buf: Buffer, start: number): { data: Buffer; next: 
       } else {
         throw new Error('bad deflate block type');
       }
-      inflateBlock(reader, out, lit, dist);
+      inflateBlock(reader, sink, lit, dist);
     }
     if (final === 1) break;
   }
   reader.alignByte();
   // Skip the 4-byte adler32.
-  return { data: Buffer.from(out), next: reader.bytePos + 4 };
+  const data = sink.len === sink.buf.length ? sink.buf : Buffer.from(sink.buf.subarray(0, sink.len));
+  return { data, next: reader.bytePos + 4 };
 }
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let i = 0;
@@ -335,7 +389,7 @@ export function ingestPack(store: Store, pack: Buffer): number {
   let read = 0;
   const rawByOffset = new Map<number, { type: ObjectType; data: Buffer }>();
 
-  const inflateAt = (start: number): { data: Buffer; next: number } => inflateExact(pack, start);
+  const inflateAt = (start: number, size: number): { data: Buffer; next: number } => inflateExact(pack, start, size);
 
   while (read < count) {
     const header = readPackObjectHeader(pack, offset);
@@ -350,19 +404,19 @@ export function ingestPack(store: Store, pack: Buffer): number {
         baseOffsetDelta = ((baseOffsetDelta + 1) << 7) | (byte & 0x7f);
       }
       const baseOffset = offset - baseOffsetDelta;
-      const { data, next } = inflateAt(i);
+      const { data, next } = inflateAt(i, header.size);
       pending.push({ baseOffset, type: 'blob', delta: data });
       byOffset.set(offset, `pending:${pending.length - 1}`);
       rawByOffset.set(offset, { type: 'blob', data: Buffer.alloc(0) });
       offset = next;
     } else if (header.type === 7) {
       const baseSha = pack.toString('hex', dataStart, dataStart + 20);
-      const { data, next } = inflateAt(dataStart + 20);
+      const { data, next } = inflateAt(dataStart + 20, header.size);
       pending.push({ baseSha, type: 'blob', delta: data });
       byOffset.set(offset, `pending:${pending.length - 1}`);
       offset = next;
     } else {
-      const { data, next } = inflateAt(dataStart);
+      const { data, next } = inflateAt(dataStart, header.size);
       const type = TYPE_NAMES[header.type] as ObjectType;
       const sha = store.writeObject(type, data);
       byOffset.set(offset, sha);
@@ -562,7 +616,18 @@ function shallowClosure(store: Store, tips: string[], depth: number): { objects:
   return { objects, shallow: boundary };
 }
 
+/**
+ * Fetch packs are a pure function of (wants, haves, deepen) over an append-only,
+ * content-addressed object store, so a pack built under the current object epoch stays
+ * valid until a new object lands. Repeated identical fetches (concurrent clones of one
+ * history) reuse the built bytes instead of walking the closure and re-deflating.
+ */
+const packCache = new Map<string, { pack: Buffer; shallow: string[] }>();
+
 function fetchResponse(store: Store, repo: Repo, wants: string[], haves: string[], deepen: number | null): { pack: Buffer; shallow: string[] } {
+  const cacheKey = `${store.objectEpoch}|${deepen ?? ''}|${wants.join(',')}|${haves.join(',')}`;
+  const cached = packCache.get(cacheKey);
+  if (cached) return cached;
   const wantCommits = wants.filter((sha) => store.readCommit(sha));
   let objects: Map<string, GitObject>;
   let shallow: string[] = [];
@@ -592,7 +657,10 @@ function fetchResponse(store: Store, repo: Repo, wants: string[], haves: string[
     }
   }
   void repo;
-  return { pack: buildPack(objects, store), shallow };
+  const result = { pack: buildPack(objects, store), shallow };
+  if (packCache.size >= 128) packCache.clear();
+  packCache.set(cacheKey, result);
+  return result;
 }
 
 function uploadPackV0(store: Store, repo: Repo, body: Buffer): RestResult {

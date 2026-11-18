@@ -176,6 +176,8 @@ export interface Repo {
 
 export class Store {
   objects = new Map<string, GitObject>();
+  /** Bumped whenever a brand-new object lands; lets readers cache derivations safely. */
+  objectEpoch = 0;
   repos = new Map<string, Repo>();
   private repoSeq = 0;
   private commentSeq = 0;
@@ -184,7 +186,10 @@ export class Store {
 
   writeObject(type: ObjectType, data: Buffer): string {
     const sha = hashObject(type, data);
-    if (!this.objects.has(sha)) this.objects.set(sha, { type, data });
+    if (!this.objects.has(sha)) {
+      this.objects.set(sha, { type, data });
+      this.objectEpoch += 1;
+    }
     return sha;
   }
 
